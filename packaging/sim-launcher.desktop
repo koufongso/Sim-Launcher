@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Sim Launcher
+Comment=Start PX4 SITL/HITL with Gazebo
+Exec=sim-launcher-app
+Icon=sim-launcher
+Categories=Utility;
+Terminal=false

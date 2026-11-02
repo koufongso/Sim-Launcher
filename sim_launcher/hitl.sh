@@ -64,6 +64,19 @@ gz service -s "/world/$WORLD/create" --reqtype gz.msgs.EntityFactory --reptype g
     --timeout 5000 --req "name: \"$MODEL\", allow_renaming: false, sdf: '$SDF'" | grep -q true \
     || fail "could not spawn $MODEL"
 
+# The bridge's subscriptions and publishers can stay unconnected for good when
+# they're made while Gazebo is still creating the vehicle's sensors, motors and
+# servos (the vehicle then sits on the ground at full throttle). Start it only
+# once the vehicle is up, as the groundstation app's bridge is started by hand.
+echo "=== $(stamp) waiting for $MODEL's sensors"
+IMU_TOPIC="/world/$WORLD/model/$MODEL/link/base_link/sensor/imu_sensor/imu"
+tries=0
+until timeout 5 gz topic -e -n 1 -t "$IMU_TOPIC" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 12 ] && fail "$MODEL's IMU does not publish ($IMU_TOPIC)"
+done
+sleep 3
+
 # Retry delay: doubles while the bridge keeps failing right away, back to
 # 1 s once a run lasted a while (e.g. after the Pixhawk rebooted)
 delay=1

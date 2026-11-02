@@ -56,7 +56,7 @@ try:
     Magnetometer = importlib.import_module(f"{_msgs}.magnetometer_pb2").Magnetometer
     FluidPressure = importlib.import_module(f"{_msgs}.fluid_pressure_pb2").FluidPressure
     NavSat = importlib.import_module(f"{_msgs}.navsat_pb2").NavSat
-    AirSpeedSensor = importlib.import_module(f"{_msgs}.air_speed_sensor_pb2").AirSpeedSensor
+    AirSpeed = importlib.import_module(f"{_msgs}.air_speed_pb2").AirSpeed
     Actuators = importlib.import_module(f"{_msgs}.actuators_pb2").Actuators
     Double = importlib.import_module(f"{_msgs}.double_pb2").Double
     GZ_TRANSPORT_AVAILABLE = True
@@ -199,7 +199,7 @@ class HITLConfig:
     # Actuator configuration
     num_motors: int = 5  # Number of motors (standard_vtol has 5)
     num_servos: int = 4  # Number of servos (aileron, elevator, rudder, etc.)
-    motor_max_rpm: float = 1000.0  # Maximum motor RPM for simulation
+    motor_max_velocity: float = 1055.0  # Maximum motor velocity in rad/s (the model SDF's maxRotVelocity)
     servo_angle_max: float = 0.5236  # 30 degrees in radians
     servo_angle_min: float = -0.5236
 
@@ -234,7 +234,11 @@ class HITLBridge:
         # Gazebo node
         self._gz_node: Optional[Node] = None
 
+        # Gazebo sensor subscriptions, see _setup_gz_subscriptions
+        self._gz_subscriptions = []
+
         # Gazebo publishers for actuators
+        self._gz_pub_node: Optional[Node] = None
         self._motor_pub = None  # Publisher for motor speeds
         self._servo_pubs = []  # Publishers for servos
 
@@ -243,6 +247,7 @@ class HITLBridge:
         self._gps_thread: Optional[threading.Thread] = None
         self._receive_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
 
         # Callbacks
         self._actuator_callback: Optional[Callable[[Dict[str, Any]], None]] = None
@@ -319,51 +324,51 @@ class HITLBridge:
         model = self.config.model_name
 
         # Note: gz-transport Python subscribe signature is (msg_type, topic, callback)
-
-        # IMU topic
-        imu_topic = f"/world/{world}/model/{model}/link/base_link/sensor/imu_sensor/imu"
-        self._gz_node.subscribe(IMU, imu_topic, self._on_imu)
-        self._log(f"Subscribed to IMU: {imu_topic}")
-
-        # Magnetometer topic
-        mag_topic = f"/world/{world}/model/{model}/link/base_link/sensor/magnetometer_sensor/magnetometer"
-        self._gz_node.subscribe(Magnetometer, mag_topic, self._on_magnetometer)
-        self._log(f"Subscribed to Magnetometer: {mag_topic}")
-
-        # Barometer topic
-        baro_topic = f"/world/{world}/model/{model}/link/base_link/sensor/air_pressure_sensor/air_pressure"
-        self._gz_node.subscribe(FluidPressure, baro_topic, self._on_barometer)
-        self._log(f"Subscribed to Barometer: {baro_topic}")
-
-        # GPS topic
-        gps_topic = f"/world/{world}/model/{model}/link/base_link/sensor/navsat_sensor/navsat"
-        self._gz_node.subscribe(NavSat, gps_topic, self._on_gps)
-        self._log(f"Subscribed to GPS: {gps_topic}")
-
-        # Airspeed topic
-        airspeed_topic = f"/world/{world}/model/{model}/link/airspeed_link/sensor/air_speed/air_speed"
-        self._gz_node.subscribe(AirSpeedSensor, airspeed_topic, self._on_airspeed)
-        self._log(f"Subscribed to Airspeed: {airspeed_topic}")
+        sensors = f"/world/{world}/model/{model}/link/base_link/sensor"
+        # (name, message type, topic, callback, when its data last came)
+        self._gz_subscriptions = [
+            ("IMU", IMU, f"{sensors}/imu_sensor/imu", self._on_imu,
+             lambda: self._sensor_state.imu_timestamp),
+            ("Magnetometer", Magnetometer, f"{sensors}/magnetometer_sensor/magnetometer", self._on_magnetometer,
+             lambda: self._sensor_state.mag_timestamp),
+            ("Barometer", FluidPressure, f"{sensors}/air_pressure_sensor/air_pressure", self._on_barometer,
+             lambda: self._sensor_state.baro_timestamp),
+            ("GPS", NavSat, f"{sensors}/navsat_sensor/navsat", self._on_gps,
+             lambda: self._gps_state.timestamp),
+            ("Airspeed", AirSpeed, f"/world/{world}/model/{model}/link/airspeed_link/sensor/air_speed/air_speed",
+             self._on_airspeed, lambda: self._sensor_state.airspeed_timestamp),
+        ]
+        for name, msg_type, topic, callback, _ in self._gz_subscriptions:
+            self._gz_node.subscribe(msg_type, topic, callback)
+            self._log(f"Subscribed to {name}: {topic}")
 
         # Setup actuator publishers
         self._setup_actuator_publishers(model)
 
     def _setup_actuator_publishers(self, model: str):
-        """Setup publishers for motors and servos."""
+        """Setup publishers for motors and servos.
+
+        On a node of their own: a topic can't be advertised twice on one node,
+        and advertising again is how the watchdog reconnects them.
+        """
+        node = Node()
         # Motor speed publisher
         # Topic: /{model}/command/motor_speed
         motor_topic = f"/{model}/command/motor_speed"
-        self._motor_pub = self._gz_node.advertise(motor_topic, Actuators)
+        motor_pub = node.advertise(motor_topic, Actuators)
         self._log(f"Publishing motors to: {motor_topic}")
 
         # Servo publishers (one per servo)
         # Topic: /model/{model}/servo_{i}
-        self._servo_pubs = []
+        servo_pubs = []
         for i in range(self.config.num_servos):
             servo_topic = f"/model/{model}/servo_{i}"
-            pub = self._gz_node.advertise(servo_topic, Double)
-            self._servo_pubs.append(pub)
+            servo_pubs.append(node.advertise(servo_topic, Double))
             self._log(f"Publishing servo {i} to: {servo_topic}")
+
+        self._gz_pub_node = node
+        self._motor_pub = motor_pub
+        self._servo_pubs = servo_pubs
 
     def _on_imu(self, msg: IMU):
         """Handle IMU message from Gazebo."""
@@ -442,20 +447,11 @@ class HITLBridge:
 
             self._gps_state.timestamp = time.time()
 
-    def _on_airspeed(self, msg: AirSpeedSensor):
+    def _on_airspeed(self, msg: AirSpeed):
         """Handle airspeed message from Gazebo."""
         with self._state_lock:
-            # Convert differential pressure to mbar
-            # AirSpeedSensor provides diff_pressure in Pa
-            if hasattr(msg, 'diff_pressure'):
-                self._sensor_state.diff_pressure = msg.diff_pressure * 0.01
-            else:
-                # Calculate from airspeed using Bernoulli equation
-                # diff_pressure = 0.5 * rho * v^2
-                # At sea level, rho ≈ 1.225 kg/m^3
-                rho = 1.225
-                v = msg.speed if hasattr(msg, 'speed') else 0.0
-                self._sensor_state.diff_pressure = 0.5 * rho * v * v * 0.01  # Pa to mbar
+            # Convert differential pressure from Pa to mbar
+            self._sensor_state.diff_pressure = msg.diff_pressure * 0.01
 
             self._sensor_state.airspeed_timestamp = time.time()
             self._sensor_state.fields_updated |= HILSensorFields.DIFF_PRESSURE
@@ -499,6 +495,14 @@ class HITLBridge:
         )
         self._heartbeat_thread.start()
 
+        # Start watchdog for the Gazebo connections
+        self._watchdog_thread = threading.Thread(
+            target=self._gz_watchdog_loop,
+            name="Gazebo_Watchdog",
+            daemon=True
+        )
+        self._watchdog_thread.start()
+
         self._log("HITL Bridge started")
 
     def stop(self):
@@ -507,7 +511,7 @@ class HITLBridge:
 
         # Wait for threads to finish
         for thread in [self._sensor_thread, self._gps_thread,
-                       self._receive_thread, self._heartbeat_thread]:
+                       self._receive_thread, self._heartbeat_thread, self._watchdog_thread]:
             if thread and thread.is_alive():
                 thread.join(timeout=1.0)
 
@@ -697,10 +701,9 @@ class HITLBridge:
                 # Convert normalized controls to velocity (rad/s or RPM)
                 # Motors are typically in controls[0:num_motors]
                 for i in range(self.config.num_motors):
-                    # Normalize 0-1 to 0-max_rpm (convert to rad/s for Gazebo)
+                    # Normalized 0-1 to rad/s, up to the motor model's maxRotVelocity
                     value = max(0.0, min(1.0, controls[i]))
-                    # Convert to angular velocity (rad/s) assuming max_rpm
-                    velocity = value * self.config.motor_max_rpm * (2 * math.pi / 60)
+                    velocity = value * self.config.motor_max_velocity
                     motor_msg.velocity.append(velocity)
 
                 self._motor_pub.publish(motor_msg)
@@ -741,6 +744,59 @@ class HITLBridge:
                 self._stats['errors'] += 1
 
             time.sleep(self.config.heartbeat_interval)
+
+    def _gz_watchdog_loop(self):
+        """Reconnect Gazebo topics that don't get through, both ways.
+
+        Unlike a serial port or UDP socket, a gz-transport topic is a
+        connection between two nodes that discovery has to set up, and a
+        subscription or publisher made while Gazebo is still creating the
+        vehicle can stay unconnected for good without an error (seen with the
+        IMU right after the vehicle is spawned). So:
+        - a sensor topic that sends nothing is subscribed again;
+        - when an actuator topic has no subscriber (the motor model or servo
+          controller), all actuator topics are advertised again on a new node.
+        The wait doubles after each try, up to 30 s, so a model without one of
+        the sensors isn't retried often.
+        """
+        def backoff():
+            return {"wait": 2.0, "deadline": time.time() + 2.0}
+
+        sensors = {topic: backoff() for _, _, topic, _, _ in self._gz_subscriptions}
+        actuators = backoff()
+        while self._running:
+            time.sleep(1.0)
+            now = time.time()
+
+            for name, msg_type, topic, callback, last_data in self._gz_subscriptions:
+                state = sensors[topic]
+                if now - last_data() < 2.0:
+                    sensors[topic] = backoff()
+                    continue
+                if now < state["deadline"]:
+                    continue
+                self._log(f"No {name} data; subscribing again")
+                try:
+                    self._gz_node.unsubscribe(topic)
+                    self._gz_node.subscribe(msg_type, topic, callback)
+                except Exception as e:
+                    self._log(f"ERROR subscribing to {topic}: {e}")
+                    self._stats['errors'] += 1
+                state["wait"] = min(state["wait"] * 2, 30.0)
+                state["deadline"] = now + state["wait"]
+
+            pubs = [p for p in [self._motor_pub] + self._servo_pubs if p is not None]
+            if all(p.has_connections() for p in pubs):
+                actuators = backoff()
+            elif now >= actuators["deadline"]:
+                self._log("Motor or servo topic not connected to Gazebo; advertising again")
+                try:
+                    self._setup_actuator_publishers(self.config.model_name)
+                except Exception as e:
+                    self._log(f"ERROR advertising actuator topics: {e}")
+                    self._stats['errors'] += 1
+                actuators["wait"] = min(actuators["wait"] * 2, 30.0)
+                actuators["deadline"] = now + actuators["wait"]
 
     def set_actuator_callback(self, callback: Callable[[Dict[str, Any]], None]):
         """Set callback for actuator control messages."""
@@ -815,8 +871,8 @@ Typical setup with mavlink-router:
         help="Number of servos (default: 4)"
     )
     parser.add_argument(
-        "--motor-rpm", type=float, default=1000.0,
-        help="Maximum motor RPM (default: 1000)"
+        "--motor-max-vel", type=float, default=1055.0,
+        help="Maximum motor velocity in rad/s, the model SDF's maxRotVelocity (default: 1055)"
     )
     parser.add_argument(
         "--component-id", type=int, default=190,
@@ -846,7 +902,7 @@ Typical setup with mavlink-router:
         hil_gps_rate=args.gps_rate,
         num_motors=args.num_motors,
         num_servos=args.num_servos,
-        motor_max_rpm=args.motor_rpm,
+        motor_max_velocity=args.motor_max_vel,
         component_id=args.component_id,
     )
 
